@@ -1,0 +1,12 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+angr_env/
+.pytest_cache/
+
+# Rust / Build artifacts
+build_rustsketch/
+a.out
+divergence_report.json
+target/
