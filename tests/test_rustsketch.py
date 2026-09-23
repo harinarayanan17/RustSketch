@@ -158,6 +158,39 @@ def test_fixture02_pointer_outparam_fixed_equivalence(tmp_path):
         assert r.solver_status == "UNSAT"
 
 
+def test_fixture02_pointer_outparam_auto_detection(tmp_path):
+    # Test auto-detection on fixed implementation (pointer_mode omitted / None)
+    build_dir_fixed = str(tmp_path / "build_f2_auto_fixed")
+    results_fixed = run_rustsketch(
+        c_dir="tests/fixtures/02_pointer_outparam/c",
+        rust_dir="tests/fixtures/02_pointer_outparam/rust_fixed/src",
+        build_dir=build_dir_fixed
+    )
+    assert len(results_fixed) >= 1
+    assert all(r.is_equivalent for r in results_fixed) is True
+    for r in results_fixed:
+        assert r.solver_status == "UNSAT"
+
+    # Test auto-detection on buggy implementation (pointer_mode omitted / None)
+    build_dir_buggy = str(tmp_path / "build_f2_auto_buggy")
+    results_buggy = run_rustsketch(
+        c_dir="tests/fixtures/02_pointer_outparam/c",
+        rust_dir="tests/fixtures/02_pointer_outparam/rust_buggy/src",
+        build_dir=build_dir_buggy
+    )
+    assert len(results_buggy) >= 1
+    assert all(r.is_equivalent for r in results_buggy) is False
+    buggy_caller = next(r for r in results_buggy if r.function_name == "caller_transform")
+    assert buggy_caller.solver_status == "SAT"
+
+    # Test server pre-scan helper
+    from server import detect_c_pointers
+    assert detect_c_pointers("void transform_ptr(int *ptr, int scale, int offset) { *ptr = scale; }") is True
+    assert detect_c_pointers("int add(int a, int b) { return a + b; }") is False
+    assert detect_c_pointers("int main(int argc, char **argv) { return 0; }") is False
+
+
+
 def test_c_rust_multi_file_project_equivalence(tmp_path):
     if not (os.path.exists("/home/hari/test/c_project") and os.path.exists("/home/hari/test/rust_project")):
         pytest.skip("Test fixtures in /home/hari/test not found")
@@ -171,4 +204,35 @@ def test_c_rust_multi_file_project_equivalence(tmp_path):
     assert all(r.is_equivalent for r in results)
     for r in results:
         assert r.solver_status == "UNSAT"
+
+
+def test_fact_loop_equivalence(tmp_path):
+    if not (os.path.exists("/home/hari/test/fact.c") and os.path.exists("/home/hari/test/fact_rust.rs")):
+        pytest.skip("Factorial fixtures not found")
+    build_dir = str(tmp_path / "build_fact_test")
+    results = run_rustsketch(
+        c_path="/home/hari/test/fact.c",
+        rust_path="/home/hari/test/fact_rust.rs",
+        build_dir=build_dir
+    )
+    assert len(results) >= 1
+    assert all(r.is_equivalent for r in results)
+    for r in results:
+        assert r.solver_status == "UNSAT"
+
+
+def test_point_struct_equivalence(tmp_path):
+    if not (os.path.exists("/home/hari/test/point.c") and os.path.exists("/home/hari/test/point_rust.rs")):
+        pytest.skip("Point fixtures not found")
+    build_dir = str(tmp_path / "build_point_test")
+    results = run_rustsketch(
+        c_path="/home/hari/test/point.c",
+        rust_path="/home/hari/test/point_rust.rs",
+        build_dir=build_dir
+    )
+    assert len(results) >= 1
+    assert all(r.is_equivalent for r in results)
+    for r in results:
+        assert r.solver_status == "UNSAT"
+
 

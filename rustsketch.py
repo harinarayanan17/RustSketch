@@ -25,10 +25,16 @@ import argparse
 import subprocess
 from typing import Dict, List, Optional, Tuple, Any
 
-import angr
-import claripy
-import z3
-from colorama import Fore, Style, init
+try:
+    import angr
+    import claripy
+    import z3
+    from colorama import Fore, Style, init
+except ModuleNotFoundError:
+    venv_python = os.path.join(os.path.dirname(os.path.abspath(__file__)), "angr_env", "bin", "python3")
+    if os.path.exists(venv_python) and sys.executable != venv_python:
+        os.execv(venv_python, [venv_python] + sys.argv)
+    raise
 
 init(autoreset=True)
 
@@ -420,6 +426,7 @@ class HelperSummarizer:
     def summarize(cls, proj: angr.Project, func_name: str, language: str,
                   num_args: int = 1, global_candidates: List[str] = None,
                   is_pointer_arg: bool = False,
+                  ptr_indices: Optional[List[int]] = None,
                   shared_sym_inputs: Optional[Dict[str, Any]] = None) -> FunctionSummary:
         if global_candidates is None:
             global_candidates = ["g_counter", "G_COUNTER", "global_var", "counter", "state", "status"]
@@ -434,6 +441,10 @@ class HelperSummarizer:
             raise ValueError(f"Function symbol '{func_name}' not found in {proj.filename}")
 
         ptr_buf_addr = 0x70000000
+        ptr_buf_size = 16
+
+        if ptr_indices is None:
+            ptr_indices = [0] if is_pointer_arg else []
 
         # Retrieve or create shared symbolic arguments
         if shared_sym_inputs and "args" in shared_sym_inputs:
@@ -441,8 +452,9 @@ class HelperSummarizer:
         else:
             sym_args = []
             for i in range(num_args):
-                if i == 0 and is_pointer_arg:
-                    sym_args.append(claripy.BVV(ptr_buf_addr, 64))
+                if is_pointer_arg and i in ptr_indices:
+                    offset = ptr_indices.index(i) * 0x1000
+                    sym_args.append(claripy.BVV(ptr_buf_addr + offset, 64))
                 else:
                     sym_args.append(claripy.BVS(f"arg_{i}", 32))
 
@@ -467,13 +479,19 @@ class HelperSummarizer:
             add_options={angr.options.ZERO_FILL_UNCONSTRAINED_REGISTERS}
         )
 
-        # Initialize pointer memory buffer
+        # Initialize pointer memory buffer(s)
         if is_pointer_arg:
-            if shared_sym_inputs and "ptr_init" in shared_sym_inputs:
-                init_ptr_val = shared_sym_inputs["ptr_init"]
+            if shared_sym_inputs and "ptr_inits" in shared_sym_inputs:
+                ptr_inits = shared_sym_inputs["ptr_inits"]
+            elif shared_sym_inputs and "ptr_init" in shared_sym_inputs and shared_sym_inputs["ptr_init"] is not None:
+                ptr_inits = {ptr_indices[0]: shared_sym_inputs["ptr_init"]} if ptr_indices else {}
             else:
-                init_ptr_val = claripy.BVS("init_ptr_val", 32)
-            state.memory.store(ptr_buf_addr, init_ptr_val, endness=proj.arch.memory_endness)
+                ptr_inits = {idx: claripy.BVS(f"init_ptr_val_{idx}", ptr_buf_size * 8) for idx in ptr_indices}
+
+            for idx in ptr_indices:
+                offset = ptr_indices.index(idx) * 0x1000
+                init_val = ptr_inits.get(idx, claripy.BVS(f"init_ptr_val_{idx}", ptr_buf_size * 8))
+                state.memory.store(ptr_buf_addr + offset, init_val, endness=proj.arch.memory_endness)
 
         # Initialize global variable with symbolic initial value
         if global_addr is not None:
@@ -483,9 +501,9 @@ class HelperSummarizer:
                 init_g_val = claripy.BVS(f"init_{global_sym_name}", 32)
             state.memory.store(global_addr, init_g_val, endness=proj.arch.memory_endness)
 
-        # Explore feasible paths to return
+        # Explore feasible paths to return (bounded to 10 for loops and branches)
         simgr = proj.factory.simulation_manager(state)
-        simgr.explore(find=ret_addr, num_find=50)
+        simgr.explore(find=ret_addr, num_find=10)
 
         paths = []
         for end_state in simgr.found:
@@ -496,8 +514,9 @@ class HelperSummarizer:
                 mut_globals[global_sym_name] = end_state.memory.load(global_addr, 4, endness=proj.arch.memory_endness)
 
             mut_ptr = None
-            if is_pointer_arg:
-                mut_ptr = end_state.memory.load(ptr_buf_addr, 4, endness=proj.arch.memory_endness)
+            if is_pointer_arg and ptr_indices:
+                # Load mutation for primary pointer
+                mut_ptr = end_state.memory.load(ptr_buf_addr, ptr_buf_size, endness=proj.arch.memory_endness)
 
             paths.append({
                 "constraints": end_state.solver.constraints,
@@ -575,7 +594,8 @@ class EquivalenceCheckerModule:
         return sigs
 
     def check_helper_equivalence(self, func_name: str, num_args: int = 1,
-                                 is_pointer_arg: bool = False) -> EquivalenceResult:
+                                 is_pointer_arg: bool = False,
+                                 ptr_indices: Optional[List[int]] = None) -> EquivalenceResult:
         # Check if C function returns void
         is_void = False
         if self.c_ll_path and os.path.exists(self.c_ll_path):
@@ -588,16 +608,21 @@ class EquivalenceCheckerModule:
                 pass
 
         ptr_buf_addr = 0x70000000
+        ptr_buf_size = 16
+
+        if ptr_indices is None:
+            ptr_indices = [0] if is_pointer_arg else []
 
         # Create shared symbolic inputs
         shared_args = []
         for i in range(num_args):
-            if i == 0 and is_pointer_arg:
-                shared_args.append(claripy.BVV(ptr_buf_addr, 64))
+            if is_pointer_arg and i in ptr_indices:
+                offset = ptr_indices.index(i) * 0x1000
+                shared_args.append(claripy.BVV(ptr_buf_addr + offset, 64))
             else:
                 shared_args.append(claripy.BVS(f"shared_arg_{i}", 32))
 
-        shared_ptr_init = claripy.BVS("shared_ptr_init", 32) if is_pointer_arg else None
+        shared_ptr_init = claripy.BVS("shared_ptr_init", ptr_buf_size * 8) if is_pointer_arg else None
         shared_g_init = claripy.BVS("shared_g_init", 32)
 
         shared_inputs = {
@@ -609,7 +634,7 @@ class EquivalenceCheckerModule:
         # Summarize C helper
         c_summary = HelperSummarizer.summarize(
             self.c_proj, func_name, "c", num_args,
-            is_pointer_arg=is_pointer_arg, shared_sym_inputs=shared_inputs
+            is_pointer_arg=is_pointer_arg, ptr_indices=ptr_indices, shared_sym_inputs=shared_inputs
         )
         self.repo.store(c_summary)
 
@@ -618,7 +643,7 @@ class EquivalenceCheckerModule:
         rust_summary = HelperSummarizer.summarize(
             self.rust_proj, func_name, "rust", num_args,
             global_candidates=preferred_candidates,
-            is_pointer_arg=is_pointer_arg, shared_sym_inputs=shared_inputs
+            is_pointer_arg=is_pointer_arg, ptr_indices=ptr_indices, shared_sym_inputs=shared_inputs
         )
         self.repo.store(rust_summary)
 
@@ -666,7 +691,7 @@ class EquivalenceCheckerModule:
                     divergence_found = True
                     cex = {}
                     for i, arg in enumerate(shared_args):
-                        if i == 0 and is_pointer_arg:
+                        if is_pointer_arg and i in ptr_indices:
                             continue
                         cex[f"arg_{i}"] = solver.eval(arg, 1)[0]
                     if is_pointer_arg and shared_ptr_init is not None:
@@ -747,7 +772,7 @@ class EquivalenceCheckerModule:
             state_c.memory.store(g_addr_c, shared_g_init, endness=self.c_proj.arch.memory_endness)
 
         simgr_c = self.c_proj.factory.simulation_manager(state_c)
-        simgr_c.explore(find=ret_addr, num_find=50)
+        simgr_c.explore(find=ret_addr, num_find=10)
         if not simgr_c.found:
             raise RuntimeError(f"C caller function '{caller_name}' execution did not reach return.")
 
@@ -768,7 +793,7 @@ class EquivalenceCheckerModule:
             state_r.memory.store(g_addr_r, shared_g_init, endness=self.rust_proj.arch.memory_endness)
 
         simgr_r = self.rust_proj.factory.simulation_manager(state_r)
-        simgr_r.explore(find=ret_addr, num_find=50)
+        simgr_r.explore(find=ret_addr, num_find=10)
         if not simgr_r.found:
             raise RuntimeError(f"Rust caller function '{caller_name}' execution did not reach return.")
 
@@ -907,7 +932,7 @@ class ReportGenerator:
 def run_rustsketch(c_path: Optional[str] = None, rust_path: Optional[str] = None,
                    build_dir: str = "build_rustsketch",
                    include_dir: Optional[str] = None, json_report: Optional[str] = None,
-                   pointer_mode: bool = False,
+                   pointer_mode: Optional[bool] = None,
                    c_dir: Optional[str] = None, rust_dir: Optional[str] = None) -> List[EquivalenceResult]:
     
     c_target = c_path or c_dir
@@ -948,35 +973,87 @@ def run_rustsketch(c_path: Optional[str] = None, rust_path: Optional[str] = None
     checker = EquivalenceCheckerModule(c_proj, rust_proj, repo, c_ll_path=artifacts.get("c_linked_ll"))
     results = []
 
-    # Parse signatures from C LLVM IR
-    signatures = checker.parse_signatures(artifacts.get("c_linked_ll"))
+    # Parse signatures from C and Rust LLVM IR
+    c_signatures = checker.parse_signatures(artifacts.get("c_linked_ll"))
+    rust_signatures = checker.parse_signatures(artifacts.get("rust_ll"))
+
+    # Auto-detection of pointer out-parameters from C signatures
+    funcs_with_ptrs = [
+        fname for fname, sig in c_signatures.items()
+        if fname != "main" and sig.get("has_pointer_arg", False)
+    ]
+    auto_detected_pointers = len(funcs_with_ptrs) > 0
+
+    if pointer_mode is None:
+        effective_pointer_mode = auto_detected_pointers
+        if effective_pointer_mode:
+            ReportGenerator.print_stage(
+                f"Stage 3.2: [Auto-Detection] Pointer parameter(s) detected in C ({', '.join(funcs_with_ptrs)}). "
+                f"Auto-enabling Pointer Out-Parameter Tracking."
+            )
+    else:
+        effective_pointer_mode = pointer_mode
+
+    # Check for structural interface mismatches (functions defined in one language but missing in the other)
+    c_user_funcs = set(f for f in c_signatures if f != "main")
+    rust_user_funcs = set(
+        f for f in rust_signatures
+        if f != "main" and not f.startswith("_") and "core" not in f and "std" not in f and "alloc" not in f
+    )
+
+    c_missing_in_rust = sorted(list(c_user_funcs - rust_user_funcs))
+    rust_missing_in_c = sorted(list(rust_user_funcs - c_user_funcs))
+
+    if c_missing_in_rust or rust_missing_in_c:
+        ReportGenerator.print_stage("Stage 3.1: Checking Interface & Function Conformity...")
+        for fname in c_missing_in_rust:
+            res = EquivalenceResult(
+                function_name=fname,
+                is_equivalent=False,
+                solver_status="SAT",
+                details=f"Structural divergence: Function '{fname}' is defined in C source, but missing or unexported in Rust target."
+            )
+            results.append(res)
+            ReportGenerator.print_result(res)
+        for fname in rust_missing_in_c:
+            res = EquivalenceResult(
+                function_name=fname,
+                is_equivalent=False,
+                solver_status="SAT",
+                details=f"Structural divergence: Function '{fname}' is defined in Rust source, but missing in C target."
+            )
+            results.append(res)
+            ReportGenerator.print_result(res)
 
     # Step 6: Equivalence Checking
     # 6.1 Check Helpers
     if hierarchy["helpers"]:
         ReportGenerator.print_stage("Stage 4 & 5: Extracting Helper Summaries & Intra-Procedural Checking...")
         for helper_name in hierarchy["helpers"]:
-            sig = signatures.get(helper_name, {})
-            num_args = sig.get("num_args", 1 if not pointer_mode else 3)
-            is_ptr = sig.get("has_pointer_arg", pointer_mode) or pointer_mode
+            sig = c_signatures.get(helper_name, {})
+            num_args = sig.get("num_args", 1 if not effective_pointer_mode else 3)
+            if "has_pointer_arg" in sig:
+                is_ptr = sig["has_pointer_arg"]
+            else:
+                is_ptr = effective_pointer_mode
+            ptr_indices = sig.get("ptr_indices", [0] if is_ptr else [])
             res = checker.check_helper_equivalence(
                 helper_name,
                 num_args=num_args,
-                is_pointer_arg=is_ptr
+                is_pointer_arg=is_ptr,
+                ptr_indices=ptr_indices
             )
             results.append(res)
             ReportGenerator.print_result(res)
 
     # 6.2 Check Callers (Inter-Procedural Compositional)
     user_callers = [c for c in hierarchy["callers"] if c != "main"]
-    if not user_callers and "main" in hierarchy["callers"] and has_user_main:
-        user_callers = ["main"]
 
     if user_callers:
         ReportGenerator.print_stage("Stage 6: Composing Inter-Procedural Models & Solver Verification...")
         for caller_name in user_callers:
-            sig = signatures.get(caller_name, {})
-            num_args = sig.get("num_args", 2 if not pointer_mode else 3)
+            sig = c_signatures.get(caller_name, {})
+            num_args = sig.get("num_args", 2 if not effective_pointer_mode else 3)
             res = checker.check_compositional_caller(
                 caller_name,
                 num_args=num_args
@@ -1010,9 +1087,24 @@ def main():
     parser.add_argument("--build-dir", default="build_rustsketch", help="Build directory for intermediate artifacts")
     parser.add_argument("--include-dir", default=None, help="C include directory")
     parser.add_argument("--json-report", default=None, help="Path to write JSON equivalence report")
-    parser.add_argument("--pointer-mode", action="store_true", help="Enable pointer out-parameter tracking")
+    parser.add_argument(
+        "--pointer-mode",
+        nargs="?",
+        const="on",
+        default="auto",
+        choices=["auto", "on", "off", "true", "false"],
+        help="Enable pointer out-parameter tracking (auto, on, off). Default is auto."
+    )
 
     args = parser.parse_args()
+
+    ptr_mode = None
+    if args.pointer_mode in ["on", "true"]:
+        ptr_mode = True
+    elif args.pointer_mode in ["off", "false"]:
+        ptr_mode = False
+    else:
+        ptr_mode = None
 
     results = run_rustsketch(
         c_path=args.c_path,
@@ -1020,7 +1112,7 @@ def main():
         build_dir=args.build_dir,
         include_dir=args.include_dir,
         json_report=args.json_report,
-        pointer_mode=args.pointer_mode
+        pointer_mode=ptr_mode
     )
 
     all_eq = all(r.is_equivalent for r in results)

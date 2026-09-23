@@ -1,0 +1,41 @@
+[
+  {
+    "function": "helper_update",
+    "equivalent": false,
+    "verdict": "SAT",
+    "details": "Behavioral divergence detected. Counter-example witness found.",
+    "counterexample": {
+      "arg_0": 2147483161,
+      "initial_global": 0
+    },
+    "c_outputs": {
+      "return": 2147482187,
+      "ptr_val": null,
+      "global_state": 2147482187
+    },
+    "rust_outputs": {
+      "return": 4294966332,
+      "ptr_val": null,
+      "global_state": 0
+    }
+  },
+  {
+    "function": "caller_compute",
+    "equivalent": false,
+    "verdict": "SAT",
+    "details": "Whole-program behavioral divergence detected in caller execution path.",
+    "counterexample": {
+      "arg_0": 131107,
+      "arg_1": 4294967294,
+      "initial_global": 0
+    },
+    "c_outputs": {
+      "return": 1179951,
+      "final_global": 393315
+    },
+    "rust_outputs": {
+      "return": 262230,
+      "final_global": 0
+    }
+  }
+]
