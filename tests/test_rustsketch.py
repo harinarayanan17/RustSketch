@@ -236,3 +236,207 @@ def test_point_struct_equivalence(tmp_path):
         assert r.solver_status == "UNSAT"
 
 
+def test_pattern1_aliased_parameters_equivalence(tmp_path):
+    c_file = tmp_path / "p1.c"
+    rust_fixed = tmp_path / "p1_fixed.rs"
+    rust_buggy = tmp_path / "p1_buggy.rs"
+
+    c_file.write_text("""
+void update(int *a, int *b) {
+    *a = 10;
+    *b = 20;
+}
+
+int caller_baz(void) {
+    int x = 1;
+    update(&x, &x);
+    return x;
+}
+
+int main() {
+    return caller_baz();
+}
+""")
+
+    rust_fixed.write_text("""
+#[no_mangle]
+pub unsafe extern "C" fn update(a: *mut i32, b: *mut i32) {
+    *a = 10;
+    *b = 20;
+}
+
+#[no_mangle]
+pub extern "C" fn caller_baz() -> i32 {
+    let mut x = 1;
+    unsafe {
+        update(&mut x as *mut i32, &mut x as *mut i32);
+    }
+    x
+}
+
+fn main() {
+    let res = caller_baz();
+    std::process::exit(res);
+}
+""")
+
+    rust_buggy.write_text("""
+#[no_mangle]
+pub unsafe extern "C" fn update(a: *mut i32, b: *mut i32) {
+    *a = 10;
+}
+
+#[no_mangle]
+pub extern "C" fn caller_baz() -> i32 {
+    let mut x = 1;
+    unsafe {
+        update(&mut x as *mut i32, &mut x as *mut i32);
+    }
+    x
+}
+
+fn main() {
+    let res = caller_baz();
+    std::process::exit(res);
+}
+""")
+
+    res_fixed = run_rustsketch(
+        c_path=str(c_file),
+        rust_path=str(rust_fixed),
+        build_dir=str(tmp_path / "build_p1_fixed")
+    )
+    assert len(res_fixed) >= 1
+    assert all(r.is_equivalent for r in res_fixed)
+
+    res_buggy = run_rustsketch(
+        c_path=str(c_file),
+        rust_path=str(rust_buggy),
+        build_dir=str(tmp_path / "build_p1_buggy")
+    )
+    assert any(not r.is_equivalent for r in res_buggy)
+
+
+def test_pattern2_double_pointer_nullify_equivalence(tmp_path):
+    c_file = tmp_path / "p2.c"
+    rust_fixed = tmp_path / "p2_fixed.rs"
+
+    c_file.write_text("""
+void nullify_ptr(int **p) {
+    *p = 0;
+}
+
+int caller_nullify(void) {
+    int target = 42;
+    int *p = &target;
+    nullify_ptr(&p);
+    return (p == 0) ? 1 : 0;
+}
+
+int main() {
+    return caller_nullify();
+}
+""")
+
+    rust_fixed.write_text("""
+#[no_mangle]
+pub unsafe extern "C" fn nullify_ptr(p: *mut *mut i32) {
+    *p = std::ptr::null_mut();
+}
+
+#[no_mangle]
+pub extern "C" fn caller_nullify() -> i32 {
+    let mut target = 42;
+    let mut p = &mut target as *mut i32;
+    unsafe {
+        nullify_ptr(&mut p as *mut *mut i32);
+    }
+    if p.is_null() { 1 } else { 0 }
+}
+
+fn main() {
+    let res = caller_nullify();
+    std::process::exit(res);
+}
+""")
+
+    res_fixed = run_rustsketch(
+        c_path=str(c_file),
+        rust_path=str(rust_fixed),
+        build_dir=str(tmp_path / "build_p2_fixed")
+    )
+    assert len(res_fixed) >= 1
+    assert all(r.is_equivalent for r in res_fixed)
+
+
+def test_pattern6_union_variant_equivalence(tmp_path):
+    c_file = tmp_path / "p6.c"
+    rust_fixed = tmp_path / "p6_fixed.rs"
+
+    c_file.write_text("""
+typedef union {
+    int i;
+    float f;
+} Number;
+
+void init_as_int(Number *n, int v) {
+    n->i = v;
+}
+
+int get_as_int(Number *n) {
+    return n->i;
+}
+
+int caller_demo(void) {
+    Number n;
+    init_as_int(&n, 42);
+    return get_as_int(&n);
+}
+
+int main() {
+    return caller_demo();
+}
+""")
+
+    rust_fixed.write_text("""
+#[repr(C)]
+pub union Number {
+    pub i: i32,
+    pub f: f32,
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn init_as_int(n: *mut Number, v: i32) {
+    (*n).i = v;
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn get_as_int(n: *mut Number) -> i32 {
+    (*n).i
+}
+
+#[no_mangle]
+pub extern "C" fn caller_demo() -> i32 {
+    let mut n = Number { i: 0 };
+    unsafe {
+        init_as_int(&mut n as *mut Number, 42);
+        get_as_int(&mut n as *mut Number)
+    }
+}
+
+fn main() {
+    let res = caller_demo();
+    std::process::exit(res);
+}
+""")
+
+    res_fixed = run_rustsketch(
+        c_path=str(c_file),
+        rust_path=str(rust_fixed),
+        build_dir=str(tmp_path / "build_p6_fixed")
+    )
+    assert len(res_fixed) >= 1
+    assert all(r.is_equivalent for r in res_fixed)
+
+
+

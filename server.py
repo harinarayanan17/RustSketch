@@ -617,7 +617,7 @@ extern int {fn_name}({', '.join(['int' for _ in range(len(args_list))]) if args_
 
 int main() {{
     printf("[RustSketch C Harness] Testing '{fn_name}' with counter-example witness:\\n");
-{chr(10).join([f"    printf(\"  • {k} = {v} (hex: 0x{v:x} if applicable)\\n\");" for k, v in cex.items() if isinstance(v, int)])}
+{chr(10).join([f"    printf(\"  • {k} = {v} (hex: 0x{v & 0xffffffff:x} if applicable)\\n\");" for k, v in cex.items() if isinstance(v, int)])}
 
     int result = {fn_name}({args_str});
     printf("[RustSketch C Harness] Actual Return = %d\\n", result);
@@ -640,7 +640,7 @@ extern "C" {{
 
 fn main() {{
     println!("[RustSketch Rust Harness] Testing '{fn_name}' with counter-example witness:");
-{chr(10).join([f"    println!(\"  • {k} = {v} (0x{v:x})\");" for k, v in cex.items() if isinstance(v, int)])}
+{chr(10).join([f"    println!(\"  • {k} = {v} (0x{v & 0xffffffff:x})\");" for k, v in cex.items() if isinstance(v, int)])}
 
     unsafe {{
         let result = {fn_name}({args_str});

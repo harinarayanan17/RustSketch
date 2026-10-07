@@ -1,0 +1,46 @@
+[
+  {
+    "id": "01_hash_pipeline",
+    "title": "FNV-1a & Murmur Avalanche Hash Pipeline (5 functions)",
+    "functions": 5,
+    "correct_verdict": "UNSAT",
+    "correct_time": 1.95,
+    "correct_passed": true,
+    "buggy_verdict": "SAT",
+    "buggy_time": 2.84,
+    "buggy_passed": true
+  },
+  {
+    "id": "02_packet_ringbuffer",
+    "title": "Circular Ring Buffer & Packet Header Protocol (4 functions)",
+    "functions": 4,
+    "correct_verdict": "UNSAT",
+    "correct_time": 4.34,
+    "correct_passed": true,
+    "buggy_verdict": "SAT",
+    "buggy_time": 4.32,
+    "buggy_passed": true
+  },
+  {
+    "id": "03_matrix_transform",
+    "title": "3D Vector & Affine Matrix Transformation Engine (5 functions)",
+    "functions": 5,
+    "correct_verdict": "UNSAT",
+    "correct_time": 3.55,
+    "correct_passed": true,
+    "buggy_verdict": "SAT",
+    "buggy_time": 3.47,
+    "buggy_passed": true
+  },
+  {
+    "id": "04_multi_file_banking",
+    "title": "Multi-File Modular Banking Project (helper.c, main.c / helper.rs, main.rs)",
+    "functions": 3,
+    "correct_verdict": "UNSAT",
+    "correct_time": 2.14,
+    "correct_passed": true,
+    "buggy_verdict": "N/A",
+    "buggy_time": null,
+    "buggy_passed": null
+  }
+]

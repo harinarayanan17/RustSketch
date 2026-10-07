@@ -105,7 +105,7 @@ export default function DivergenceInspector({
                                 {v}{' '}
                                 {typeof v === 'number' && (
                                   <span style={{ color: 'var(--text-muted)', fontSize: '10px' }}>
-                                    (0x{v.toString(16)})
+                                    (0x{(v >>> 0).toString(16)})
                                   </span>
                                 )}
                               </td>

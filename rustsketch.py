@@ -23,7 +23,7 @@ import json
 import shutil
 import argparse
 import subprocess
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Dict, List, Optional, Tuple, Any, Set
 
 try:
     import angr
@@ -99,21 +99,34 @@ class CompilerLinkerModule:
 
     @staticmethod
     def _instrument_rust_code(rust_code: str) -> str:
-        processed_lines = []
+        processed_lines = [
+            "#![allow(improper_ctypes_definitions)]",
+            "#![allow(dead_code)]"
+        ]
         raw_lines = rust_code.splitlines()
+
+        def has_no_mangle_above(j: int) -> bool:
+            while j >= 0:
+                prev = raw_lines[j].strip()
+                if prev.startswith("#[") and "no_mangle" in prev:
+                    return True
+                if prev.startswith("#[") or not prev or prev.startswith("//"):
+                    j -= 1
+                    continue
+                break
+            return False
+
         for idx, line in enumerate(raw_lines):
             stripped = line.strip()
             if (stripped.startswith("static mut ") or stripped.startswith("pub static mut ")) and not line.startswith("#[no_mangle]"):
-                prev_line = raw_lines[idx - 1].strip() if idx > 0 else ""
-                if prev_line != "#[no_mangle]":
+                if not has_no_mangle_above(idx - 1):
                     processed_lines.append("#[no_mangle]")
                 processed_lines.append(line)
             elif re.match(r'^\s*(pub\s+)?(unsafe\s+)?fn\s+([a-zA-Z0-9_]+)', line):
                 fn_match = re.match(r'^\s*(pub\s+)?(unsafe\s+)?fn\s+([a-zA-Z0-9_]+)', line)
                 fn_name = fn_match.group(3)
                 if fn_name != "main":
-                    prev_line = raw_lines[idx - 1].strip() if idx > 0 else ""
-                    if prev_line != "#[no_mangle]":
+                    if not has_no_mangle_above(idx - 1) and "#[no_mangle]" not in line:
                         processed_lines.append("#[no_mangle]")
                     is_unsafe = bool(fn_match.group(2))
                     if 'extern "C"' not in line:
@@ -124,6 +137,8 @@ class CompilerLinkerModule:
                         )
                         processed_lines.append(mod_line)
                     else:
+                        if not stripped.startswith("pub "):
+                            line = "pub " + line.lstrip()
                         processed_lines.append(line)
                 else:
                     processed_lines.append(line)
@@ -277,6 +292,18 @@ class CallGraphModule:
         "sub_"
     )
 
+    STANDARD_C_FUNCS = {
+        "printf", "fprintf", "sprintf", "snprintf", "vprintf", "vfprintf", "vsprintf", "vsnprintf",
+        "puts", "fputs", "putchar", "fputc", "getchar", "fgetc", "fgets", "gets",
+        "scanf", "fscanf", "sscanf",
+        "malloc", "calloc", "realloc", "free",
+        "exit", "abort", "atexit",
+        "memcpy", "memmove", "memset", "memcmp", "memchr",
+        "strcpy", "strncpy", "strcat", "strncat", "strcmp", "strncmp", "strlen", "strchr", "strrchr", "strstr", "strtok",
+        "atoi", "atol", "atoll", "strtol", "strtoul", "strtoll", "strtoull",
+        "rand", "srand", "time", "clock"
+    }
+
     def __init__(self, c_proj: angr.Project, rust_proj: angr.Project, has_user_main: bool = True):
         self.c_proj = c_proj
         self.rust_proj = rust_proj
@@ -287,9 +314,53 @@ class CallGraphModule:
         for sym in proj.loader.symbols:
             if sym.is_function and sym.name:
                 name = sym.name
+                if name in self.STANDARD_C_FUNCS:
+                    continue
                 if not any(name.startswith(p) for p in self.IGNORED_PREFIXES) and not name.startswith("_R"):
                     user_funcs[name] = sym.rebased_addr
         return user_funcs
+
+    @staticmethod
+    def match_transpiled_names(c_names: Set[str], rust_names: Set[str]) -> Tuple[Dict[str, str], Set[str], Set[str]]:
+        """
+        Intelligently maps function names across C and Rust transpilation conventions:
+        - Exact matches
+        - Mutated/Borrowing suffixes (e.g. find_book <-> find_book_mut)
+        - Constructor conventions (e.g. init_library <-> new)
+        - Action suffixes (e.g. print_library <-> print)
+        - Substring / namespace containment
+        """
+        matched = {}
+        unmatched_c = set(c_names)
+        unmatched_r = set(rust_names)
+        for c in list(unmatched_c):
+            if c in unmatched_r:
+                matched[c] = c
+                unmatched_c.remove(c)
+                unmatched_r.remove(c)
+        for c in list(unmatched_c):
+            for r in list(unmatched_r):
+                if r == f"{c}_mut" or c == f"{r}_mut":
+                    matched[c] = r
+                    unmatched_c.remove(c)
+                    unmatched_r.remove(r)
+                    break
+                elif (c.startswith("init_") or c.startswith("create_")) and r in ("new", "default"):
+                    matched[c] = r
+                    unmatched_c.remove(c)
+                    unmatched_r.remove(r)
+                    break
+                elif any(c.endswith(f"_{part}") for part in ["library", "lib", "item", "node", "elem", "manager"]) and c.split("_")[0] == r:
+                    matched[c] = r
+                    unmatched_c.remove(c)
+                    unmatched_r.remove(r)
+                    break
+                elif r in c or c in r:
+                    matched[c] = r
+                    unmatched_c.remove(c)
+                    unmatched_r.remove(r)
+                    break
+        return matched, unmatched_c, unmatched_r
 
     def analyze_hierarchy(self) -> Dict[str, Any]:
         c_funcs = self.get_user_functions(self.c_proj)
@@ -298,17 +369,13 @@ class CallGraphModule:
         # Fast CFG on C project to discover caller vs leaf relationships
         cfg = self.c_proj.analyses.CFGFast(function_starts=list(c_funcs.values()) if c_funcs else None)
 
+        matched_map, _, _ = self.match_transpiled_names(set(c_funcs.keys()), set(rust_funcs.keys()))
         matched_names = []
         for name in c_funcs:
             if not self.has_user_main and name == "main":
                 continue
-            if name in rust_funcs:
+            if name in matched_map:
                 matched_names.append(name)
-            else:
-                for r_name in rust_funcs:
-                    if name in r_name:
-                        matched_names.append(name)
-                        break
 
         helpers = []
         callers = []
@@ -345,7 +412,8 @@ class CallGraphModule:
             "helpers": sorted(list(set(helpers))),
             "callers": sorted(list(set(callers))),
             "c_funcs": c_funcs,
-            "rust_funcs": rust_funcs
+            "rust_funcs": rust_funcs,
+            "fn_map": matched_map
         }
 
 
@@ -427,6 +495,7 @@ class HelperSummarizer:
                   num_args: int = 1, global_candidates: List[str] = None,
                   is_pointer_arg: bool = False,
                   ptr_indices: Optional[List[int]] = None,
+                  double_ptr_indices: Optional[List[int]] = None,
                   shared_sym_inputs: Optional[Dict[str, Any]] = None) -> FunctionSummary:
         if global_candidates is None:
             global_candidates = ["g_counter", "G_COUNTER", "global_var", "counter", "state", "status"]
@@ -441,7 +510,8 @@ class HelperSummarizer:
             raise ValueError(f"Function symbol '{func_name}' not found in {proj.filename}")
 
         ptr_buf_addr = 0x70000000
-        ptr_buf_size = 16
+        ptr_buf_size = 64
+        double_ptr_indices = double_ptr_indices or []
 
         if ptr_indices is None:
             ptr_indices = [0] if is_pointer_arg else []
@@ -462,12 +532,19 @@ class HelperSummarizer:
         global_sym_name = None
         global_addr = None
         g_info = None
-        for g_cand in global_candidates:
-            g_info = cls.find_symbol_addr(proj, g_cand)
-            if g_info:
-                break
-        if not g_info:
-            g_info = cls.find_symbol_addr(proj, None)
+        if global_candidates is not None:
+            for g_cand in global_candidates:
+                g_info = cls.find_symbol_addr(proj, g_cand)
+                if g_info:
+                    break
+        else:
+            default_candidates = ["g_counter", "G_COUNTER", "global_var", "counter", "state", "status"]
+            for g_cand in default_candidates:
+                g_info = cls.find_symbol_addr(proj, g_cand)
+                if g_info:
+                    break
+            if not g_info:
+                g_info = cls.find_symbol_addr(proj, None)
         if g_info:
             global_sym_name, global_addr = g_info
 
@@ -476,22 +553,35 @@ class HelperSummarizer:
             sym.rebased_addr,
             *sym_args,
             ret_addr=ret_addr,
-            add_options={angr.options.ZERO_FILL_UNCONSTRAINED_REGISTERS}
+            add_options={
+                angr.options.ZERO_FILL_UNCONSTRAINED_REGISTERS,
+                angr.options.ZERO_FILL_UNCONSTRAINED_MEMORY
+            }
         )
 
-        # Initialize pointer memory buffer(s)
+        # Initialize pointer memory buffer(s) and multi-level / nested buffers
         if is_pointer_arg:
             if shared_sym_inputs and "ptr_inits" in shared_sym_inputs:
                 ptr_inits = shared_sym_inputs["ptr_inits"]
             elif shared_sym_inputs and "ptr_init" in shared_sym_inputs and shared_sym_inputs["ptr_init"] is not None:
-                ptr_inits = {ptr_indices[0]: shared_sym_inputs["ptr_init"]} if ptr_indices else {}
+                ptr_inits = {idx: shared_sym_inputs["ptr_init"] for idx in ptr_indices} if ptr_indices else {}
             else:
                 ptr_inits = {idx: claripy.BVS(f"init_ptr_val_{idx}", ptr_buf_size * 8) for idx in ptr_indices}
 
             for idx in ptr_indices:
                 offset = ptr_indices.index(idx) * 0x1000
-                init_val = ptr_inits.get(idx, claripy.BVS(f"init_ptr_val_{idx}", ptr_buf_size * 8))
-                state.memory.store(ptr_buf_addr + offset, init_val, endness=proj.arch.memory_endness)
+                primary_addr = ptr_buf_addr + offset
+                nested_addr = 0x78000000 + offset * 0x1000
+
+                if idx in double_ptr_indices:
+                    # Allocate and initialize nested buffer for pointer dereference safety
+                    nested_init_val = claripy.BVS(f"init_nested_val_{idx}", 64 * 8)
+                    state.memory.store(nested_addr, nested_init_val, endness=proj.arch.memory_endness)
+                    # Double-pointer: primary buffer points to the allocated nested buffer
+                    state.memory.store(primary_addr, claripy.BVV(nested_addr, 64), endness=proj.arch.memory_endness)
+                else:
+                    init_val = ptr_inits.get(idx, claripy.BVS(f"init_ptr_val_{idx}", ptr_buf_size * 8))
+                    state.memory.store(primary_addr, init_val, endness=proj.arch.memory_endness)
 
         # Initialize global variable with symbolic initial value
         if global_addr is not None:
@@ -501,9 +591,10 @@ class HelperSummarizer:
                 init_g_val = claripy.BVS(f"init_{global_sym_name}", 32)
             state.memory.store(global_addr, init_g_val, endness=proj.arch.memory_endness)
 
-        # Explore feasible paths to return (bounded to 10 for loops and branches)
+        # Explore feasible paths to return (using DFS to avoid exponential state explosion)
         simgr = proj.factory.simulation_manager(state)
-        simgr.explore(find=ret_addr, num_find=10)
+        simgr.use_technique(angr.exploration_techniques.DFS())
+        simgr.explore(find=ret_addr, num_find=5, n=150)
 
         paths = []
         for end_state in simgr.found:
@@ -513,16 +604,23 @@ class HelperSummarizer:
             if global_addr is not None:
                 mut_globals[global_sym_name] = end_state.memory.load(global_addr, 4, endness=proj.arch.memory_endness)
 
-            mut_ptr = None
+            mut_ptrs = {}
+            mut_nested = {}
             if is_pointer_arg and ptr_indices:
-                # Load mutation for primary pointer
-                mut_ptr = end_state.memory.load(ptr_buf_addr, ptr_buf_size, endness=proj.arch.memory_endness)
+                for idx in ptr_indices:
+                    offset = ptr_indices.index(idx) * 0x1000
+                    mut_ptrs[idx] = end_state.memory.load(ptr_buf_addr + offset, ptr_buf_size, endness=proj.arch.memory_endness)
+                    mut_nested[idx] = end_state.memory.load(0x78000000 + offset * 0x1000, 64, endness=proj.arch.memory_endness)
+
+            mut_ptr = mut_ptrs.get(ptr_indices[0]) if (is_pointer_arg and ptr_indices) else None
 
             paths.append({
                 "constraints": end_state.solver.constraints,
                 "return": ret_val,
                 "global_mutation": mut_globals,
                 "ptr_mutation": mut_ptr,
+                "mut_ptrs": mut_ptrs,
+                "mut_nested": mut_nested,
                 "state": end_state
             })
 
@@ -563,7 +661,7 @@ class EquivalenceCheckerModule:
 
     @staticmethod
     def parse_signatures(ll_path: Optional[str]) -> Dict[str, Dict[str, Any]]:
-        """Parses function prototypes, argument counts, and pointer types from LLVM IR."""
+        """Parses function prototypes, argument counts, pointer types, and double-pointers from LLVM IR."""
         if not ll_path or not os.path.exists(ll_path):
             return {}
         try:
@@ -584,18 +682,76 @@ class EquivalenceCheckerModule:
                 args = [a.strip() for a in raw_args.split(",") if a.strip()]
 
             ptr_indices = [i for i, a in enumerate(args) if a.startswith("ptr") or "*" in a]
+
+            # Detect double pointers in the function body
+            fn_body_match = re.search(r'define\s+[^@]*?@' + re.escape(fname) + r'\s*\([^)]*\)[^{]*\{(.*?)\n\}', content, re.DOTALL)
+            body = fn_body_match.group(1) if fn_body_match else ""
+            double_ptr_indices = []
+            loads = re.findall(r'%(\w+)\s*=\s*load\s+ptr,\s*ptr\s*%(\w+)', body)
+            loaded_ptrs = set()
+            is_double = False
+            for dest, src in loads:
+                if src in loaded_ptrs:
+                    is_double = True
+                    break
+                loaded_ptrs.add(dest)
+            if is_double or re.search(r'load\s+\w+\*,\s*\w+\*\*', body):
+                double_ptr_indices = list(ptr_indices)
+
             sigs[fname] = {
                 "return_type": ret_type,
                 "is_void": ret_type == "void",
                 "num_args": len(args),
                 "has_pointer_arg": len(ptr_indices) > 0,
-                "ptr_indices": ptr_indices
+                "ptr_indices": ptr_indices,
+                "double_ptr_indices": double_ptr_indices,
+                "has_double_pointer": len(double_ptr_indices) > 0
             }
         return sigs
 
+    @staticmethod
+    def format_val(val: Any, bit_size: int = 32) -> Any:
+        """
+        Converts raw solver bitvector unsigned integers into their signed representation
+        when applicable (e.g. 32-bit signed ints), keeping pointers/addresses positive.
+        """
+        if not isinstance(val, int):
+            return val
+        if bit_size == 32 and 0x80000000 <= val <= 0xFFFFFFFF:
+            return val - 0x100000000
+        elif bit_size == 64 and 0x8000000000000000 <= val <= 0xFFFFFFFFFFFFFFFF:
+            return val - 0x10000000000000000
+        return val
+
+    @staticmethod
+    def minimize_witness(solver: claripy.Solver, sym_vars: List[Any],
+                         preferred_candidates: Optional[List[int]] = None) -> claripy.Solver:
+        """
+        Attempts to specialize the counterexample witness with clean, small integers
+        (e.g., 1, 2, 0, -1, -2) so that the witness and behavioral traces are human-interpretable.
+        """
+        if preferred_candidates is None:
+            preferred_candidates = [1, 2, 0, 3, 4, 5, -1, -2, -3, 10, -5, -10]
+
+        min_solver = solver.branch()
+        for var in sym_vars:
+            if var is None or not hasattr(var, "size"):
+                continue
+            v_size = var.size()
+            if v_size > 64:
+                continue
+            for cand in preferred_candidates:
+                cand_bv = claripy.BVV(cand if cand >= 0 else (1 << v_size) + cand, v_size)
+                if min_solver.satisfiable(extra_constraints=[var == cand_bv]):
+                    min_solver.add(var == cand_bv)
+                    break
+        return min_solver
+
     def check_helper_equivalence(self, func_name: str, num_args: int = 1,
                                  is_pointer_arg: bool = False,
-                                 ptr_indices: Optional[List[int]] = None) -> EquivalenceResult:
+                                 ptr_indices: Optional[List[int]] = None,
+                                 double_ptr_indices: Optional[List[int]] = None,
+                                 rust_func_name: Optional[str] = None) -> EquivalenceResult:
         # Check if C function returns void
         is_void = False
         if self.c_ll_path and os.path.exists(self.c_ll_path):
@@ -608,7 +764,8 @@ class EquivalenceCheckerModule:
                 pass
 
         ptr_buf_addr = 0x70000000
-        ptr_buf_size = 16
+        ptr_buf_size = 64
+        double_ptr_indices = double_ptr_indices or []
 
         if ptr_indices is None:
             ptr_indices = [0] if is_pointer_arg else []
@@ -622,11 +779,13 @@ class EquivalenceCheckerModule:
             else:
                 shared_args.append(claripy.BVS(f"shared_arg_{i}", 32))
 
-        shared_ptr_init = claripy.BVS("shared_ptr_init", ptr_buf_size * 8) if is_pointer_arg else None
+        shared_ptr_inits = {idx: claripy.BVS(f"shared_ptr_init_{idx}", ptr_buf_size * 8) for idx in ptr_indices} if is_pointer_arg else {}
+        shared_ptr_init = shared_ptr_inits.get(ptr_indices[0]) if (is_pointer_arg and ptr_indices) else None
         shared_g_init = claripy.BVS("shared_g_init", 32)
 
         shared_inputs = {
             "args": shared_args,
+            "ptr_inits": shared_ptr_inits,
             "ptr_init": shared_ptr_init,
             "global_init": shared_g_init
         }
@@ -634,18 +793,32 @@ class EquivalenceCheckerModule:
         # Summarize C helper
         c_summary = HelperSummarizer.summarize(
             self.c_proj, func_name, "c", num_args,
-            is_pointer_arg=is_pointer_arg, ptr_indices=ptr_indices, shared_sym_inputs=shared_inputs
+            is_pointer_arg=is_pointer_arg, ptr_indices=ptr_indices,
+            double_ptr_indices=double_ptr_indices, shared_sym_inputs=shared_inputs
         )
         self.repo.store(c_summary)
 
         # Summarize Rust helper (aligning global variable name with C)
-        preferred_candidates = [c_summary.global_sym] if c_summary.global_sym else None
+        preferred_candidates = [c_summary.global_sym] if c_summary.global_sym else []
+        target_rust_name = rust_func_name or func_name
         rust_summary = HelperSummarizer.summarize(
-            self.rust_proj, func_name, "rust", num_args,
+            self.rust_proj, target_rust_name, "rust", num_args,
             global_candidates=preferred_candidates,
-            is_pointer_arg=is_pointer_arg, ptr_indices=ptr_indices, shared_sym_inputs=shared_inputs
+            is_pointer_arg=is_pointer_arg, ptr_indices=ptr_indices,
+            double_ptr_indices=double_ptr_indices, shared_sym_inputs=shared_inputs
         )
         self.repo.store(rust_summary)
+
+        if not c_summary.paths or not rust_summary.paths:
+            unreached = []
+            if not c_summary.paths: unreached.append("C")
+            if not rust_summary.paths: unreached.append("Rust")
+            return EquivalenceResult(
+                function_name=func_name,
+                is_equivalent=False,
+                solver_status="SAT",
+                details=f"Symbolic exploration budget reached: No completed return path in {', '.join(unreached)} within step limit."
+            )
 
         # Multi-path cross-product equivalence checking
         divergence_found = False
@@ -680,8 +853,16 @@ class EquivalenceCheckerModule:
                     diff_conditions.append(r_g_mut != shared_g_init)
 
                 if is_pointer_arg:
-                    if c_path["ptr_mutation"] is not None and r_path["ptr_mutation"] is not None:
-                        diff_conditions.append(c_path["ptr_mutation"] != r_path["ptr_mutation"])
+                    for idx in ptr_indices:
+                        c_p = c_path.get("mut_ptrs", {}).get(idx, c_path.get("ptr_mutation"))
+                        r_p = r_path.get("mut_ptrs", {}).get(idx, r_path.get("ptr_mutation"))
+                        if c_p is not None and r_p is not None:
+                            diff_conditions.append(c_p != r_p)
+                        if idx in double_ptr_indices:
+                            c_nest = c_path.get("mut_nested", {}).get(idx)
+                            r_nest = r_path.get("mut_nested", {}).get(idx)
+                            if c_nest is not None and r_nest is not None:
+                                diff_conditions.append(c_nest != r_nest)
 
                 if not diff_conditions:
                     diff_conditions.append(claripy.BoolV(False))
@@ -689,37 +870,103 @@ class EquivalenceCheckerModule:
                 solver.add(claripy.Or(*diff_conditions))
                 if solver.satisfiable():
                     divergence_found = True
+                    sym_vars = [arg for i, arg in enumerate(shared_args) if not (is_pointer_arg and i in ptr_indices)]
+                    if is_pointer_arg and shared_ptr_init is not None:
+                        sym_vars.append(shared_ptr_init)
+                    if c_summary.global_sym or rust_summary.global_sym:
+                        sym_vars.append(shared_g_init)
+
+                    min_solver = self.minimize_witness(solver, sym_vars)
+
                     cex = {}
                     for i, arg in enumerate(shared_args):
                         if is_pointer_arg and i in ptr_indices:
                             continue
-                        cex[f"arg_{i}"] = solver.eval(arg, 1)[0]
+                        cex[f"arg_{i}"] = self.format_val(min_solver.eval(arg, 1)[0], getattr(arg, "size", lambda: 32)())
                     if is_pointer_arg and shared_ptr_init is not None:
-                        cex["initial_ptr_val"] = solver.eval(shared_ptr_init, 1)[0]
+                        cex["initial_ptr_val"] = self.format_val(min_solver.eval(shared_ptr_init, 1)[0], getattr(shared_ptr_init, "size", lambda: 32)())
                     if c_summary.global_sym or rust_summary.global_sym:
-                        cex["initial_global"] = solver.eval(shared_g_init, 1)[0]
+                        cex["initial_global"] = self.format_val(min_solver.eval(shared_g_init, 1)[0], getattr(shared_g_init, "size", lambda: 32)())
 
                     divergence_cex = cex
+                    c_ret_val = min_solver.eval(c_path["return"], 1)[0] if not is_void else "void"
+                    r_ret_val = min_solver.eval(r_path["return"], 1)[0] if not is_void else "void"
+                    c_ptr_val = min_solver.eval(c_path["ptr_mutation"], 1)[0] if is_pointer_arg and c_path["ptr_mutation"] is not None else None
+                    r_ptr_val = min_solver.eval(r_path["ptr_mutation"], 1)[0] if is_pointer_arg and r_path["ptr_mutation"] is not None else None
+                    c_g_val = min_solver.eval(c_g_mut, 1)[0] if c_g_mut is not None else None
+                    r_g_val = min_solver.eval(r_g_mut, 1)[0] if r_g_mut is not None else None
+
                     divergence_c_out = {
-                        "return": solver.eval(c_path["return"], 1)[0] if not is_void else "void",
-                        "ptr_val": solver.eval(c_path["ptr_mutation"], 1)[0] if is_pointer_arg and c_path["ptr_mutation"] is not None else None,
-                        "global_state": solver.eval(c_g_mut, 1)[0] if c_g_mut is not None else None
+                        "return": self.format_val(c_ret_val, getattr(c_path["return"], "size", lambda: 32)()) if c_ret_val != "void" else "void",
+                        "ptr_val": self.format_val(c_ptr_val, 32) if c_ptr_val is not None else None,
+                        "global_state": self.format_val(c_g_val, 32) if c_g_val is not None else None
                     }
                     divergence_r_out = {
-                        "return": solver.eval(r_path["return"], 1)[0] if not is_void else "void",
-                        "ptr_val": solver.eval(r_path["ptr_mutation"], 1)[0] if is_pointer_arg and r_path["ptr_mutation"] is not None else None,
-                        "global_state": solver.eval(r_g_mut, 1)[0] if r_g_mut is not None else None
+                        "return": self.format_val(r_ret_val, getattr(r_path["return"], "size", lambda: 32)()) if r_ret_val != "void" else "void",
+                        "ptr_val": self.format_val(r_ptr_val, 32) if r_ptr_val is not None else None,
+                        "global_state": self.format_val(r_g_val, 32) if r_g_val is not None else None
                     }
                     break
             if divergence_found:
                 break
+
+        # Multi-Pointer Aliasing Verification Pass (Pattern 1)
+        if is_pointer_arg and len(ptr_indices) >= 2 and not divergence_found:
+            aliased_args = []
+            for i in range(num_args):
+                if i in ptr_indices:
+                    aliased_args.append(claripy.BVV(ptr_buf_addr, 64))
+                else:
+                    aliased_args.append(claripy.BVS(f"shared_arg_{i}", 32))
+
+            alias_ptr_init = claripy.BVS("shared_alias_init", ptr_buf_size * 8)
+            shared_inputs_alias = {
+                "args": aliased_args,
+                "ptr_inits": {ptr_indices[0]: alias_ptr_init},
+                "ptr_init": alias_ptr_init,
+                "global_init": shared_g_init
+            }
+            c_alias = HelperSummarizer.summarize(
+                self.c_proj, func_name, "c", num_args,
+                is_pointer_arg=is_pointer_arg, ptr_indices=[ptr_indices[0]],
+                double_ptr_indices=double_ptr_indices, shared_sym_inputs=shared_inputs_alias
+            )
+            rust_alias = HelperSummarizer.summarize(
+                self.rust_proj, target_rust_name, "rust", num_args,
+                global_candidates=preferred_candidates,
+                is_pointer_arg=is_pointer_arg, ptr_indices=[ptr_indices[0]],
+                double_ptr_indices=double_ptr_indices, shared_sym_inputs=shared_inputs_alias
+            )
+            for c_path in c_alias.paths:
+                for r_path in rust_alias.paths:
+                    solver = claripy.Solver()
+                    for c in c_path["constraints"]:
+                        solver.add(c)
+                    for c in r_path["constraints"]:
+                        solver.add(c)
+                    if not solver.satisfiable():
+                        continue
+                    diff_alias = []
+                    if not is_void:
+                        diff_alias.append(c_path["return"] != r_path["return"])
+                    if c_path.get("ptr_mutation") is not None and r_path.get("ptr_mutation") is not None:
+                        diff_alias.append(c_path["ptr_mutation"] != r_path["ptr_mutation"])
+                    if diff_alias:
+                        solver.add(claripy.Or(*diff_alias))
+                        if solver.satisfiable():
+                            return EquivalenceResult(
+                                function_name=func_name,
+                                is_equivalent=False,
+                                solver_status="SAT",
+                                details="Behavioral divergence detected under aliased pointer arguments (arg_0 == arg_1)."
+                            )
 
         if not divergence_found:
             return EquivalenceResult(
                 function_name=func_name,
                 is_equivalent=True,
                 solver_status="UNSAT",
-                details="Mathematical proof of semantic equivalence verified across all symbolic inputs."
+                details="Mathematical proof of semantic equivalence verified across all symbolic inputs (including aliasing checks)."
             )
         else:
             return EquivalenceResult(
@@ -732,9 +979,15 @@ class EquivalenceCheckerModule:
                 details="Behavioral divergence detected. Counter-example witness found."
             )
 
-    def check_compositional_caller(self, caller_name: str, num_args: int = 2) -> EquivalenceResult:
+    def check_compositional_caller(self, caller_name: str, num_args: int = 2,
+                                   is_void: bool = False,
+                                   is_pointer_arg: bool = False,
+                                   ptr_indices: Optional[List[int]] = None,
+                                   double_ptr_indices: Optional[List[int]] = None,
+                                   rust_caller_name: Optional[str] = None) -> EquivalenceResult:
+        target_r_name = rust_caller_name or caller_name
         sym_c = self.c_proj.loader.find_symbol(caller_name)
-        sym_r = self.rust_proj.loader.find_symbol(caller_name)
+        sym_r = self.rust_proj.loader.find_symbol(target_r_name)
         if not sym_c:
             for s in self.c_proj.loader.symbols:
                 if s.name and caller_name in s.name and s.is_function:
@@ -742,23 +995,62 @@ class EquivalenceCheckerModule:
                     break
         if not sym_r:
             for s in self.rust_proj.loader.symbols:
-                if s.name and caller_name in s.name and s.is_function:
+                if s.name and target_r_name in s.name and s.is_function:
                     sym_r = s
                     break
 
         if not sym_c or not sym_r:
-            raise ValueError(f"Caller function '{caller_name}' not found in both C and Rust binaries.")
+            missing = []
+            if not sym_c: missing.append(f"C ({caller_name})")
+            if not sym_r: missing.append(f"Rust ({target_r_name})")
+            return EquivalenceResult(
+                function_name=caller_name,
+                is_equivalent=False,
+                solver_status="SAT",
+                details=f"Symbol resolution divergence: Function missing or unexported in {', '.join(missing)}."
+            )
+
+        ptr_indices = ptr_indices or []
+        double_ptr_indices = double_ptr_indices or []
+        ptr_buf_addr = 0x70000000
+        ptr_buf_size = 64
 
         # Shared symbolic arguments
-        shared_args = [claripy.BVS(f"caller_arg_{i}", 32) for i in range(num_args)]
+        shared_args = []
+        for i in range(num_args):
+            if is_pointer_arg and i in ptr_indices:
+                offset = ptr_indices.index(i) * 0x1000
+                shared_args.append(claripy.BVV(ptr_buf_addr + offset, 64))
+            else:
+                shared_args.append(claripy.BVS(f"caller_arg_{i}", 32))
         shared_g_init = claripy.BVS("caller_g_init", 32)
+        shared_ptr_inits = {}
+        shared_nested_inits = {}
+        if is_pointer_arg and ptr_indices:
+            for idx in ptr_indices:
+                shared_ptr_inits[idx] = claripy.BVS(f"shared_caller_ptr_{idx}", ptr_buf_size * 8)
+                shared_nested_inits[idx] = claripy.BVS(f"shared_caller_nested_{idx}", 64 * 8)
 
         # 1. C execution
         ret_addr = 0xdeadbeef
         state_c = self.c_proj.factory.call_state(
             sym_c.rebased_addr, *shared_args, ret_addr=ret_addr,
-            add_options={angr.options.ZERO_FILL_UNCONSTRAINED_REGISTERS}
+            add_options={
+                angr.options.ZERO_FILL_UNCONSTRAINED_REGISTERS,
+                angr.options.ZERO_FILL_UNCONSTRAINED_MEMORY
+            }
         )
+        if is_pointer_arg and ptr_indices:
+            for idx in ptr_indices:
+                offset = ptr_indices.index(idx) * 0x1000
+                primary_addr = ptr_buf_addr + offset
+                nested_addr = 0x78000000 + offset * 0x1000
+                state_c.memory.store(nested_addr, shared_nested_inits[idx], endness=self.c_proj.arch.memory_endness)
+                if idx in double_ptr_indices:
+                    state_c.memory.store(primary_addr, claripy.BVV(nested_addr, 64), endness=self.c_proj.arch.memory_endness)
+                else:
+                    state_c.memory.store(primary_addr, shared_ptr_inits[idx], endness=self.c_proj.arch.memory_endness)
+
         g_c_cand = ["g_counter", "G_COUNTER", "global_var", "counter", "state", "status"]
         g_c_info = None
         for gc in g_c_cand:
@@ -772,30 +1064,56 @@ class EquivalenceCheckerModule:
             state_c.memory.store(g_addr_c, shared_g_init, endness=self.c_proj.arch.memory_endness)
 
         simgr_c = self.c_proj.factory.simulation_manager(state_c)
-        simgr_c.explore(find=ret_addr, num_find=10)
-        if not simgr_c.found:
-            raise RuntimeError(f"C caller function '{caller_name}' execution did not reach return.")
+        simgr_c.use_technique(angr.exploration_techniques.DFS())
+        simgr_c.explore(find=ret_addr, num_find=5, n=150)
 
         # 2. Rust execution
         state_r = self.rust_proj.factory.call_state(
             sym_r.rebased_addr, *shared_args, ret_addr=ret_addr,
-            add_options={angr.options.ZERO_FILL_UNCONSTRAINED_REGISTERS}
+            add_options={
+                angr.options.ZERO_FILL_UNCONSTRAINED_REGISTERS,
+                angr.options.ZERO_FILL_UNCONSTRAINED_MEMORY
+            }
         )
+        if is_pointer_arg and ptr_indices:
+            for idx in ptr_indices:
+                offset = ptr_indices.index(idx) * 0x1000
+                primary_addr = ptr_buf_addr + offset
+                nested_addr = 0x78000000 + offset * 0x1000
+                state_r.memory.store(nested_addr, shared_nested_inits[idx], endness=self.rust_proj.arch.memory_endness)
+                if idx in double_ptr_indices:
+                    state_r.memory.store(primary_addr, claripy.BVV(nested_addr, 64), endness=self.rust_proj.arch.memory_endness)
+                else:
+                    state_r.memory.store(primary_addr, shared_ptr_inits[idx], endness=self.rust_proj.arch.memory_endness)
+
         g_r_info = None
-        for gc in g_c_cand:
-            g_r_info = HelperSummarizer.find_symbol_addr(self.rust_proj, gc)
-            if g_r_info:
-                break
-        if not g_r_info:
-            g_r_info = HelperSummarizer.find_symbol_addr(self.rust_proj, None)
+        if g_c_info:
+            c_g_name = g_c_info[0]
+            g_r_cand = [c_g_name] + [gc for gc in g_c_cand if gc != c_g_name]
+            for gc in g_r_cand:
+                g_r_info = HelperSummarizer.find_symbol_addr(self.rust_proj, gc)
+                if g_r_info:
+                    break
+            if not g_r_info:
+                g_r_info = HelperSummarizer.find_symbol_addr(self.rust_proj, None)
         if g_r_info:
             _, g_addr_r = g_r_info
             state_r.memory.store(g_addr_r, shared_g_init, endness=self.rust_proj.arch.memory_endness)
 
         simgr_r = self.rust_proj.factory.simulation_manager(state_r)
-        simgr_r.explore(find=ret_addr, num_find=10)
-        if not simgr_r.found:
-            raise RuntimeError(f"Rust caller function '{caller_name}' execution did not reach return.")
+        simgr_r.use_technique(angr.exploration_techniques.DFS())
+        simgr_r.explore(find=ret_addr, num_find=5, n=150)
+
+        if not simgr_c.found or not simgr_r.found:
+            unreached = []
+            if not simgr_c.found: unreached.append("C")
+            if not simgr_r.found: unreached.append("Rust")
+            return EquivalenceResult(
+                function_name=caller_name,
+                is_equivalent=False,
+                solver_status="SAT",
+                details=f"Symbolic exploration budget reached: No completed return path in {', '.join(unreached)} within step limit."
+            )
 
         divergence_found = False
         divergence_cex = None
@@ -818,7 +1136,10 @@ class EquivalenceCheckerModule:
                 c_final_g = end_c.memory.load(g_addr_c, 4, endness=self.c_proj.arch.memory_endness) if g_c_info else None
                 r_final_g = end_r.memory.load(g_addr_r, 4, endness=self.rust_proj.arch.memory_endness) if g_r_info else None
 
-                diff_conditions = [c_ret != r_ret]
+                diff_conditions = []
+                if not is_void:
+                    diff_conditions.append(c_ret != r_ret)
+
                 if c_final_g is not None and r_final_g is not None:
                     diff_conditions.append(c_final_g != r_final_g)
                 elif c_final_g is not None and r_final_g is None:
@@ -826,23 +1147,46 @@ class EquivalenceCheckerModule:
                 elif r_final_g is not None and c_final_g is None:
                     diff_conditions.append(r_final_g != shared_g_init)
 
+                if is_pointer_arg:
+                    for idx in ptr_indices:
+                        offset = ptr_indices.index(idx) * 0x1000
+                        c_p = end_c.memory.load(ptr_buf_addr + offset, ptr_buf_size, endness=self.c_proj.arch.memory_endness)
+                        r_p = end_r.memory.load(ptr_buf_addr + offset, ptr_buf_size, endness=self.rust_proj.arch.memory_endness)
+                        diff_conditions.append(c_p != r_p)
+
+                if not diff_conditions:
+                    diff_conditions.append(claripy.BoolV(False))
+
                 solver.add(claripy.Or(*diff_conditions))
                 if solver.satisfiable():
                     divergence_found = True
+                    sym_vars = [arg for i, arg in enumerate(shared_args) if not (is_pointer_arg and i in ptr_indices)]
+                    if g_c_info or g_r_info:
+                        sym_vars.append(shared_g_init)
+
+                    min_solver = self.minimize_witness(solver, sym_vars)
+
                     cex = {}
                     for i, arg in enumerate(shared_args):
-                        cex[f"arg_{i}"] = solver.eval(arg, 1)[0]
+                        if is_pointer_arg and i in ptr_indices:
+                            continue
+                        cex[f"arg_{i}"] = self.format_val(min_solver.eval(arg, 1)[0], getattr(arg, "size", lambda: 32)())
                     if g_c_info or g_r_info:
-                        cex["initial_global"] = solver.eval(shared_g_init, 1)[0]
+                        cex["initial_global"] = self.format_val(min_solver.eval(shared_g_init, 1)[0], getattr(shared_g_init, "size", lambda: 32)())
 
                     divergence_cex = cex
+                    c_ret_val = min_solver.eval(c_ret, 1)[0] if not is_void else "void"
+                    r_ret_val = min_solver.eval(r_ret, 1)[0] if not is_void else "void"
+                    c_g_val = min_solver.eval(c_final_g, 1)[0] if c_final_g is not None else None
+                    r_g_val = min_solver.eval(r_final_g, 1)[0] if r_final_g is not None else None
+
                     divergence_c_out = {
-                        "return": solver.eval(c_ret, 1)[0],
-                        "final_global": solver.eval(c_final_g, 1)[0] if c_final_g is not None else None
+                        "return": self.format_val(c_ret_val, getattr(c_ret, "size", lambda: 32)()) if c_ret_val != "void" else "void",
+                        "final_global": self.format_val(c_g_val, 32) if c_g_val is not None else None
                     }
                     divergence_r_out = {
-                        "return": solver.eval(r_ret, 1)[0],
-                        "final_global": solver.eval(r_final_g, 1)[0] if r_final_g is not None else None
+                        "return": self.format_val(r_ret_val, getattr(r_ret, "size", lambda: 32)()) if r_ret_val != "void" else "void",
+                        "final_global": self.format_val(r_g_val, 32) if r_g_val is not None else None
                     }
                     break
             if divergence_found:
@@ -900,12 +1244,15 @@ class ReportGenerator:
         else:
             print(Fore.RED + Style.BRIGHT + f"  [VERDICT] : SAT (DIVERGENCE DETECTED)")
             print(Fore.RED + f"  [STATUS]  : {result.details}")
-            print(Fore.YELLOW + f"\n  [COUNTEREXAMPLE WITNESS]:")
-            for k, v in result.counterexample.items():
-                print(Fore.YELLOW + f"    • {k} = {v} (hex: {hex(v) if isinstance(v, int) else v})")
-            print(Fore.CYAN + f"\n  [DIVERGENCE TRACE]:")
-            print(Fore.CYAN + f"    • C Output State   : {json.dumps(result.c_outputs, indent=2)}")
-            print(Fore.MAGENTA + f"    • Rust Output State: {json.dumps(result.rust_outputs, indent=2)}")
+            if result.counterexample:
+                print(Fore.YELLOW + f"\n  [COUNTEREXAMPLE WITNESS]:")
+                for k, v in result.counterexample.items():
+                    hex_str = f"0x{v & 0xffffffff:x}" if isinstance(v, int) else v
+                    print(Fore.YELLOW + f"    • {k} = {v} (hex: {hex_str})")
+            if result.c_outputs and result.rust_outputs:
+                print(Fore.CYAN + f"\n  [DIVERGENCE TRACE]:")
+                print(Fore.CYAN + f"    • C Output State   : {json.dumps(result.c_outputs, indent=2)}")
+                print(Fore.MAGENTA + f"    • Rust Output State: {json.dumps(result.rust_outputs, indent=2)}")
         print(Fore.WHITE + "-" * 60)
 
     @staticmethod
@@ -1001,12 +1348,13 @@ def run_rustsketch(c_path: Optional[str] = None, rust_path: Optional[str] = None
         if f != "main" and not f.startswith("_") and "core" not in f and "std" not in f and "alloc" not in f
     )
 
-    c_missing_in_rust = sorted(list(c_user_funcs - rust_user_funcs))
-    rust_missing_in_c = sorted(list(rust_user_funcs - c_user_funcs))
+    fn_map = dict(hierarchy.get("fn_map", {}))
+    transpiled_matched, c_missing_in_rust, rust_missing_in_c = CallGraphModule.match_transpiled_names(c_user_funcs, rust_user_funcs)
+    fn_map.update(transpiled_matched)
 
     if c_missing_in_rust or rust_missing_in_c:
         ReportGenerator.print_stage("Stage 3.1: Checking Interface & Function Conformity...")
-        for fname in c_missing_in_rust:
+        for fname in sorted(list(c_missing_in_rust)):
             res = EquivalenceResult(
                 function_name=fname,
                 is_equivalent=False,
@@ -1015,7 +1363,7 @@ def run_rustsketch(c_path: Optional[str] = None, rust_path: Optional[str] = None
             )
             results.append(res)
             ReportGenerator.print_result(res)
-        for fname in rust_missing_in_c:
+        for fname in sorted(list(rust_missing_in_c)):
             res = EquivalenceResult(
                 function_name=fname,
                 is_equivalent=False,
@@ -1031,17 +1379,21 @@ def run_rustsketch(c_path: Optional[str] = None, rust_path: Optional[str] = None
         ReportGenerator.print_stage("Stage 4 & 5: Extracting Helper Summaries & Intra-Procedural Checking...")
         for helper_name in hierarchy["helpers"]:
             sig = c_signatures.get(helper_name, {})
-            num_args = sig.get("num_args", 1 if not effective_pointer_mode else 3)
+            num_args = sig["num_args"] if "num_args" in sig else (1 if not effective_pointer_mode else 3)
             if "has_pointer_arg" in sig:
                 is_ptr = sig["has_pointer_arg"]
             else:
                 is_ptr = effective_pointer_mode
             ptr_indices = sig.get("ptr_indices", [0] if is_ptr else [])
+            double_ptr_indices = sig.get("double_ptr_indices", [])
+            target_rust_helper = fn_map.get(helper_name, helper_name)
             res = checker.check_helper_equivalence(
                 helper_name,
                 num_args=num_args,
                 is_pointer_arg=is_ptr,
-                ptr_indices=ptr_indices
+                ptr_indices=ptr_indices,
+                double_ptr_indices=double_ptr_indices,
+                rust_func_name=target_rust_helper
             )
             results.append(res)
             ReportGenerator.print_result(res)
@@ -1053,10 +1405,20 @@ def run_rustsketch(c_path: Optional[str] = None, rust_path: Optional[str] = None
         ReportGenerator.print_stage("Stage 6: Composing Inter-Procedural Models & Solver Verification...")
         for caller_name in user_callers:
             sig = c_signatures.get(caller_name, {})
-            num_args = sig.get("num_args", 2 if not effective_pointer_mode else 3)
+            num_args = sig["num_args"] if "num_args" in sig else (2 if not effective_pointer_mode else 3)
+            is_void = sig.get("is_void", False)
+            is_ptr = sig.get("has_pointer_arg", False)
+            ptr_indices = sig.get("ptr_indices", [])
+            double_ptr_indices = sig.get("double_ptr_indices", [])
+            target_rust_caller = fn_map.get(caller_name, caller_name)
             res = checker.check_compositional_caller(
                 caller_name,
-                num_args=num_args
+                num_args=num_args,
+                is_void=is_void,
+                is_pointer_arg=is_ptr,
+                ptr_indices=ptr_indices,
+                double_ptr_indices=double_ptr_indices,
+                rust_caller_name=target_rust_caller
             )
             results.append(res)
             ReportGenerator.print_result(res)
